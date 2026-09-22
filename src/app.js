@@ -1,2225 +1,2125 @@
 import "dotenv/config";
 
 import {
-    Client,
-    GatewayIntentBits,
-    Partials,
-    PermissionsBitField,
-    AuditLogEvent
+  Client,
+  GatewayIntentBits,
+  Partials,
+  PermissionsBitField,
+  ChannelType,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  AuditLogEvent
 } from "discord.js";
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /* =========================================================
-   BK CONFIG
-========================================================= */
+   BK SECURITY
+   ========================================================= */
 
-const PREFIX = "!";
 const BOT_NAME = "BK";
-const VERSION = "2.0.0";
+const VERSION = "3.0.0";
+const PREFIX = "!";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "bk.json");
 const BACKUP_FILE = path.join(DATA_DIR, "bk.backup.json");
 
-const WINDOW_MS = 60_000;
-const AUDIT_LOOKBACK_MS = 15_000;
+const COUNTER_WINDOW = 60_000;
+const AUDIT_LOOKBACK = 15_000;
 
-/*
- * Default security limits.
- *
- * These are PER USER, PER SERVER, PER 60 SECONDS.
- */
-const DEFAULT_LIMITS = Object.freeze({
+/* =========================================================
+   DEFAULT CONFIG
+   ========================================================= */
+
+const DEFAULT_LIMITS = {
+  ban: 3,
+  kick: 5,
+  role: 5,
+  channel: 3,
+  webhook: 3
+};
+
+const DEFAULT_CONFIG = {
+  enabled: true,
+
+  limits: {
     ban: 3,
     kick: 5,
     role: 5,
     channel: 3,
     webhook: 3
-});
+  },
 
-const VALID_ACTIONS = new Set([
-    "ban",
-    "kick",
-    "role",
-    "channel",
-    "webhook"
-]);
+  punishment: "ban",
 
-const VALID_PUNISHMENTS = new Set([
-    "ban",
-    "strip",
-    "both"
-]);
+  whitelist: [],
+
+  logChannelId: null
+};
 
 /* =========================================================
    CLIENT
-========================================================= */
+   ========================================================= */
 
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildModeration
-    ],
-    partials: [
-        Partials.GuildMember,
-        Partials.User,
-        Partials.Channel
-    ]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildModeration
+  ],
+
+  partials: [
+    Partials.GuildMember,
+    Partials.User,
+    Partials.Channel
+  ]
 });
 
 /* =========================================================
-   RUNTIME STATE
-========================================================= */
+   RUNTIME
+   ========================================================= */
 
-/*
- * Counters are intentionally runtime-only.
- *
- * guildId
- *   └── userId
- *        └── action
- *             └── timestamps[]
- */
 const counters = new Map();
-
-/*
- * Prevent the same audit-log event from being processed twice.
- */
-const processedEvents = new Map();
-
-/*
- * Prevent repeated punishments from racing each other.
- */
+const processedEvents = new Set();
 const punishmentLocks = new Set();
 
 /* =========================================================
    DATABASE
-========================================================= */
+   ========================================================= */
 
-function defaultGuildConfig() {
-    return {
-        enabled: true,
-
-        logChannelId: null,
-
-        whitelist: [],
-
-        punishment: "ban",
-
-        limits: {
-            ban: DEFAULT_LIMITS.ban,
-            kick: DEFAULT_LIMITS.kick,
-            role: DEFAULT_LIMITS.role,
-            channel: DEFAULT_LIMITS.channel,
-            webhook: DEFAULT_LIMITS.webhook
-        }
-    };
-}
+let database = {
+  guilds: {}
+};
 
 function ensureDataDirectory() {
-    try {
-        if (!fs.existsSync(DATA_DIR)) {
-            fs.mkdirSync(DATA_DIR, {
-                recursive: true
-            });
-        }
-
-        return true;
-    } catch (error) {
-        console.error(
-            "[BK DATABASE] Could not create data directory:",
-            error
-        );
-
-        return false;
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, {
+        recursive: true
+      });
     }
+  } catch (error) {
+    console.error("[BK] Failed to create data directory:", error);
+  }
 }
 
 function loadDatabase() {
-    if (!ensureDataDirectory()) {
-        return {};
+  ensureDataDirectory();
+
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      saveDatabase();
+      return;
     }
+
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
+
+    if (!raw.trim()) {
+      saveDatabase();
+      return;
+    }
+
+    const parsed = JSON.parse(raw);
+
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.guilds !== "object"
+    ) {
+      throw new Error("Invalid database format.");
+    }
+
+    database = parsed;
+
+    console.log("[BK] Database loaded.");
+  } catch (error) {
+    console.error("[BK] Database corrupted:", error);
 
     try {
-        if (!fs.existsSync(DATA_FILE)) {
-            fs.writeFileSync(
-                DATA_FILE,
-                JSON.stringify({}, null, 4),
-                "utf8"
-            );
-
-            return {};
-        }
-
-        const raw = fs.readFileSync(
-            DATA_FILE,
-            "utf8"
-        );
-
-        if (!raw.trim()) {
-            return {};
-        }
-
-        const parsed = JSON.parse(raw);
-
-        if (
-            !parsed ||
-            typeof parsed !== "object" ||
-            Array.isArray(parsed)
-        ) {
-            throw new Error(
-                "Database root must be an object."
-            );
-        }
-
-        return parsed;
-    } catch (error) {
-        console.error(
-            "[BK DATABASE] Database could not be read:",
-            error
-        );
-
-        /*
-         * Preserve the broken file before recovering.
-         */
-        try {
-            if (fs.existsSync(DATA_FILE)) {
-                fs.copyFileSync(
-                    DATA_FILE,
-                    BACKUP_FILE
-                );
-
-                console.warn(
-                    "[BK DATABASE] Broken database backed up."
-                );
-            }
-        } catch (backupError) {
-            console.error(
-                "[BK DATABASE] Backup failed:",
-                backupError
-            );
-        }
-
-        /*
-         * Recover with a clean database.
-         */
-        return {};
+      if (fs.existsSync(DATA_FILE)) {
+        fs.copyFileSync(DATA_FILE, BACKUP_FILE);
+      }
+    } catch (backupError) {
+      console.error(
+        "[BK] Failed to create database backup:",
+        backupError
+      );
     }
-}
 
-let database = loadDatabase();
+    database = {
+      guilds: {}
+    };
+
+    saveDatabase();
+  }
+}
 
 function saveDatabase() {
-    if (!ensureDataDirectory()) {
-        return false;
-    }
+  ensureDataDirectory();
 
-    const tempFile =
-        `${DATA_FILE}.tmp`;
+  try {
+    const tempFile = `${DATA_FILE}.tmp`;
 
-    try {
-        /*
-         * Write to a temporary file first.
-         *
-         * This prevents a partially-written JSON file
-         * if the process has an I/O problem.
-         */
-        fs.writeFileSync(
-            tempFile,
-            JSON.stringify(
-                database,
-                null,
-                4
-            ),
-            "utf8"
-        );
+    fs.writeFileSync(
+      tempFile,
+      JSON.stringify(database, null, 2),
+      "utf8"
+    );
 
-        fs.renameSync(
-            tempFile,
-            DATA_FILE
-        );
-
-        return true;
-    } catch (error) {
-        console.error(
-            "[BK DATABASE] Save failed:",
-            error
-        );
-
-        try {
-            if (fs.existsSync(tempFile)) {
-                fs.unlinkSync(tempFile);
-            }
-        } catch {}
-
-        return false;
-    }
+    fs.renameSync(tempFile, DATA_FILE);
+  } catch (error) {
+    console.error("[BK] Failed to save database:", error);
+  }
 }
+
+/* =========================================================
+   GUILD CONFIG
+   ========================================================= */
 
 function getGuildConfig(guildId) {
-    if (!guildId) {
-        return defaultGuildConfig();
-    }
+  if (!database.guilds[guildId]) {
+    database.guilds[guildId] = {
+      enabled: DEFAULT_CONFIG.enabled,
 
+      limits: {
+        ...DEFAULT_LIMITS
+      },
+
+      punishment: DEFAULT_CONFIG.punishment,
+
+      whitelist: [],
+
+      logChannelId: null
+    };
+
+    saveDatabase();
+  }
+
+  const config = database.guilds[guildId];
+
+  config.limits ??= {};
+
+  for (const [key, value] of Object.entries(DEFAULT_LIMITS)) {
     if (
-        !database[guildId] ||
-        typeof database[guildId] !== "object"
+      typeof config.limits[key] !== "number" ||
+      config.limits[key] < 1
     ) {
-        database[guildId] =
-            defaultGuildConfig();
-
-        saveDatabase();
+      config.limits[key] = value;
     }
+  }
 
-    const config =
-        database[guildId];
+  if (!Array.isArray(config.whitelist)) {
+    config.whitelist = [];
+  }
 
-    /*
-     * Repair missing fields from older database versions.
-     */
-    config.enabled =
-        typeof config.enabled === "boolean"
-            ? config.enabled
-            : true;
+  if (
+    !["ban", "strip", "both"].includes(
+      config.punishment
+    )
+  ) {
+    config.punishment = "ban";
+  }
 
-    config.logChannelId ??= null;
+  if (typeof config.enabled !== "boolean") {
+    config.enabled = true;
+  }
 
-    if (!Array.isArray(config.whitelist)) {
-        config.whitelist = [];
-    }
-
-    if (
-        !VALID_PUNISHMENTS.has(
-            config.punishment
-        )
-    ) {
-        config.punishment = "ban";
-    }
-
-    if (
-        !config.limits ||
-        typeof config.limits !== "object"
-    ) {
-        config.limits = {
-            ...DEFAULT_LIMITS
-        };
-    }
-
-    for (const action of Object.keys(DEFAULT_LIMITS)) {
-        const value =
-            Number(config.limits[action]);
-
-        if (
-            !Number.isInteger(value) ||
-            value < 1 ||
-            value > 100
-        ) {
-            config.limits[action] =
-                DEFAULT_LIMITS[action];
-        }
-    }
-
-    return config;
+  return config;
 }
 
 /* =========================================================
-   SAFE UTILITIES
-========================================================= */
+   BOX SYSTEM
+   ========================================================= */
 
-function safeString(value, fallback = "unknown") {
-    if (
-        value === null ||
-        value === undefined
-    ) {
-        return fallback;
-    }
+function createBox(title, lines = [], footer = "BK") {
+  const width = 36;
 
-    return String(value);
-}
+  const top = `╭${"─".repeat(width)}╮`;
+  const middle = `├${"─".repeat(width)}┤`;
+  const bottom = `╰${"─".repeat(width)}╯`;
 
-function truncate(value, max = 200) {
-    return safeString(value).slice(0, max);
-}
+  const output = [];
 
-function sleep(ms) {
-    return new Promise(resolve =>
-        setTimeout(resolve, ms)
+  output.push(top);
+
+  const titleText = String(title)
+    .slice(0, width - 2);
+
+  const titlePadding =
+    width - titleText.length - 2;
+
+  const leftPadding =
+    Math.floor(titlePadding / 2);
+
+  const rightPadding =
+    titlePadding - leftPadding;
+
+  output.push(
+    `│${" ".repeat(leftPadding)}${titleText}${" ".repeat(
+      rightPadding
+    )}│`
+  );
+
+  output.push(middle);
+
+  for (const line of lines) {
+    const text = String(line)
+      .slice(0, width - 2);
+
+    output.push(
+      `│ ${text.padEnd(width - 2)} │`
     );
+  }
+
+  output.push(bottom);
+  output.push(`│ ${footer}`);
+
+  return output.join("\n");
 }
 
 /* =========================================================
-   BOX MESSAGES
-========================================================= */
+   RESPONSE BOXES
+   ========================================================= */
 
-function makeBox(title, lines = []) {
-    const width = 34;
-
-    const top =
-        `╭${"─".repeat(width)}╮`;
-
-    const divider =
-        `├${"─".repeat(width)}┤`;
-
-    const bottom =
-        `╰${"─".repeat(width)}╯`;
-
-    const output = [
-        top,
-        `│${center(title, width)}│`,
-        divider
-    ];
-
-    for (const line of lines) {
-        const clean =
-            truncate(line, width - 2);
-
-        output.push(
-            `│ ${clean.padEnd(width - 2)} │`
-        );
-    }
-
-    output.push(bottom);
-    output.push(`│ ${BOT_NAME} • SECURITY`);
-
-    return output.join("\n");
+function responseSuccess(title, lines) {
+  return createBox(
+    `✓ ${title}`,
+    lines,
+    "BK • SECURITY"
+  );
 }
 
-function center(value, width) {
-    const text =
-        truncate(value, width);
+function responseError(lines) {
+  return createBox(
+    "⚠ ERROR",
+    lines,
+    "BK"
+  );
+}
 
-    const left =
-        Math.floor(
-            (width - text.length) / 2
-        );
+function responseSecurity(lines) {
+  return createBox(
+    "⚠ BK SECURITY",
+    lines,
+    "BK • ANTI-NUKE"
+  );
+}
 
-    const right =
-        width - text.length - left;
-
-    return (
-        " ".repeat(Math.max(0, left)) +
-        text +
-        " ".repeat(Math.max(0, right))
-    );
+function responseInfo(title, lines) {
+  return createBox(
+    `◆ ${title}`,
+    lines,
+    "BK • SECURITY"
+  );
 }
 
 /* =========================================================
-   SAFE DISCORD SEND
-========================================================= */
+   SAFE SEND
+   ========================================================= */
 
-async function safeSend(channel, content) {
-    try {
-        if (
-            !channel ||
-            !channel.isTextBased()
-        ) {
-            return null;
-        }
+async function safeSend(channel, payload) {
+  if (!channel) {
+    return null;
+  }
 
-        return await channel.send({
-            content: truncate(
-                content,
-                2000
-            )
-        });
-    } catch (error) {
-        console.error(
-            "[BK SEND ERROR]",
-            error?.message || error
-        );
-
-        return null;
+  try {
+    if (typeof payload === "string") {
+      return await channel.send({
+        content: payload
+      });
     }
+
+    return await channel.send(payload);
+  } catch (error) {
+    console.error("[BK] Failed to send message:", error);
+    return null;
+  }
 }
 
 /* =========================================================
    PERMISSION HELPERS
-========================================================= */
+   ========================================================= */
 
-function isServerOwner(guild, userId) {
-    return (
-        Boolean(guild) &&
-        guild.ownerId === userId
-    );
-}
-
-function isBKWhitelisted(guild, userId) {
-    if (!guild || !userId) {
-        return false;
-    }
-
-    if (
-        isServerOwner(
-            guild,
-            userId
-        )
-    ) {
-        return true;
-    }
-
-    const config =
-        getGuildConfig(guild.id);
-
-    return config.whitelist.includes(
-        userId
-    );
-}
-
-function canConfigureBK(
-    guild,
-    userId
-) {
-    /*
-     * Security settings are owner-only.
-     */
-    return isServerOwner(
-        guild,
-        userId
-    );
-}
-
-/* =========================================================
-   COUNTERS
-========================================================= */
-
-function getUserActionArray(
-    guildId,
-    userId,
-    action
-) {
-    if (!counters.has(guildId)) {
-        counters.set(
-            guildId,
-            new Map()
-        );
-    }
-
-    const guildMap =
-        counters.get(guildId);
-
-    if (!guildMap.has(userId)) {
-        guildMap.set(
-            userId,
-            {}
-        );
-    }
-
-    const userMap =
-        guildMap.get(userId);
-
-    if (!Array.isArray(userMap[action])) {
-        userMap[action] = [];
-    }
-
-    return userMap[action];
-}
-
-function cleanTimestamps(
-    timestamps,
-    now = Date.now()
-) {
-    while (
-        timestamps.length > 0 &&
-        now - timestamps[0] > WINDOW_MS
-    ) {
-        timestamps.shift();
-    }
-}
-
-function addAction(
-    guildId,
-    userId,
-    action
-) {
-    const now = Date.now();
-
-    const timestamps =
-        getUserActionArray(
-            guildId,
-            userId,
-            action
-        );
-
-    cleanTimestamps(
-        timestamps,
-        now
-    );
-
-    timestamps.push(now);
-
-    return timestamps.length;
-}
-
-function clearUserCounters(
-    guildId,
-    userId
-) {
-    const guildMap =
-        counters.get(guildId);
-
-    if (!guildMap) {
-        return;
-    }
-
-    guildMap.delete(userId);
-}
-
-/* =========================================================
-   EVENT DEDUPLICATION
-========================================================= */
-
-function eventWasProcessed(eventKey) {
-    const now = Date.now();
-
-    /*
-     * Clean old entries.
-     */
-    for (
-        const [key, timestamp]
-        of processedEvents
-    ) {
-        if (
-            now - timestamp >
-            WINDOW_MS
-        ) {
-            processedEvents.delete(key);
-        }
-    }
-
-    if (
-        processedEvents.has(
-            eventKey
-        )
-    ) {
-        return true;
-    }
-
-    processedEvents.set(
-        eventKey,
-        now
-    );
-
+function hasPermission(member, permission) {
+  if (!member) {
     return false;
+  }
+
+  return member.permissions.has(permission);
+}
+
+function isServerOwner(member) {
+  if (!member?.guild) {
+    return false;
+  }
+
+  return member.id === member.guild.ownerId;
+}
+
+function isWhitelisted(guild, userId) {
+  if (!guild) {
+    return false;
+  }
+
+  if (userId === guild.ownerId) {
+    return true;
+  }
+
+  const config = getGuildConfig(guild.id);
+
+  return config.whitelist.includes(userId);
+}
+
+function canManageSecurity(member) {
+  if (!member) {
+    return false;
+  }
+
+  if (isServerOwner(member)) {
+    return true;
+  }
+
+  return member.permissions.has(
+    PermissionsBitField.Flags.Administrator
+  );
 }
 
 /* =========================================================
-   SECURITY LOG
-========================================================= */
+   COUNTER SYSTEM
+   ========================================================= */
 
-async function securityLog(
-    guild,
-    content
-) {
-    try {
-        if (!guild) {
-            return;
-        }
+function getCounterKey(guildId, userId, action) {
+  return `${guildId}:${userId}:${action}`;
+}
 
-        const config =
-            getGuildConfig(guild.id);
+function registerAction(guildId, userId, action) {
+  const key = getCounterKey(
+    guildId,
+    userId,
+    action
+  );
 
-        if (!config.logChannelId) {
-            return;
-        }
+  const now = Date.now();
 
-        const channel =
-            guild.channels.cache.get(
-                config.logChannelId
-            );
+  if (!counters.has(key)) {
+    counters.set(key, []);
+  }
 
-        if (!channel) {
-            return;
-        }
+  const timestamps = counters.get(key);
 
-        await safeSend(
-            channel,
-            content
-        );
-    } catch (error) {
-        console.error(
-            "[BK LOG ERROR]",
-            error?.message || error
-        );
-    }
+  while (
+    timestamps.length > 0 &&
+    now - timestamps[0] > COUNTER_WINDOW
+  ) {
+    timestamps.shift();
+  }
+
+  timestamps.push(now);
+
+  return timestamps.length;
+}
+
+function getActionCount(guildId, userId, action) {
+  const key = getCounterKey(
+    guildId,
+    userId,
+    action
+  );
+
+  const timestamps = counters.get(key);
+
+  if (!timestamps) {
+    return 0;
+  }
+
+  const now = Date.now();
+
+  while (
+    timestamps.length > 0 &&
+    now - timestamps[0] > COUNTER_WINDOW
+  ) {
+    timestamps.shift();
+  }
+
+  return timestamps.length;
 }
 
 /* =========================================================
    AUDIT LOG
-========================================================= */
+   ========================================================= */
 
-async function findExecutor(
-    guild,
-    type,
-    targetId
+async function findAuditExecutor(
+  guild,
+  type,
+  targetId = null
 ) {
-    try {
-        if (!guild) {
-            return null;
-        }
+  try {
+    const logs = await guild.fetchAuditLogs({
+      type,
+      limit: 10
+    });
 
-        const logs =
-            await guild.fetchAuditLogs({
-                type,
-                limit: 10
-            });
+    const now = Date.now();
 
-        const now =
-            Date.now();
+    const entry = logs.entries.find((log) => {
+      if (!log?.executorId) {
+        return false;
+      }
 
-        const entry =
-            logs.entries.find(
-                auditEntry => {
-                    if (!auditEntry) {
-                        return false;
-                    }
+      if (
+        now - log.createdTimestamp >
+        AUDIT_LOOKBACK
+      ) {
+        return false;
+      }
 
-                    if (
-                        targetId &&
-                        auditEntry.targetId !==
-                            targetId
-                    ) {
-                        return false;
-                    }
+      if (
+        targetId &&
+        log.target?.id &&
+        log.target.id !== targetId
+      ) {
+        return false;
+      }
 
-                    if (
-                        !auditEntry.createdTimestamp
-                    ) {
-                        return false;
-                    }
+      return true;
+    });
 
-                    return (
-                        now -
-                            auditEntry.createdTimestamp <=
-                        AUDIT_LOOKBACK_MS
-                    );
-                }
-            );
+    return entry || null;
+  } catch (error) {
+    console.error(
+      `[BK] Audit log lookup failed for ${guild.id}:`,
+      error
+    );
 
-        return entry?.executorId || null;
-    } catch (error) {
-        /*
-         * VERY IMPORTANT:
-         *
-         * If BK can't read the audit log,
-         * it does NOT guess who did the action.
-         *
-         * Guessing could cause an innocent admin
-         * to be punished.
-         */
-        console.error(
-            "[BK AUDIT ERROR]",
-            error?.message || error
-        );
+    return null;
+  }
+}
 
-        return null;
+/* =========================================================
+   LOGGING
+   ========================================================= */
+
+async function sendSecurityLog(
+  guild,
+  content
+) {
+  try {
+    const config = getGuildConfig(guild.id);
+
+    if (!config.logChannelId) {
+      return;
     }
+
+    const channel =
+      guild.channels.cache.get(
+        config.logChannelId
+      );
+
+    if (!channel) {
+      return;
+    }
+
+    await safeSend(channel, content);
+  } catch (error) {
+    console.error(
+      "[BK] Failed to send security log:",
+      error
+    );
+  }
 }
 
 /* =========================================================
    ROLE STRIPPING
-========================================================= */
+   ========================================================= */
 
-async function stripDangerousRoles(
-    guild,
-    userId
-) {
-    try {
-        if (
-            !guild ||
-            !userId ||
-            isServerOwner(
-                guild,
-                userId
-            )
-        ) {
-            return false;
-        }
+async function stripDangerousRoles(member) {
+  if (!member) {
+    return false;
+  }
 
-        const me =
-            guild.members.me;
+  let changed = false;
 
-        if (!me) {
-            return false;
-        }
+  try {
+    const botMember =
+      member.guild.members.me;
 
-        if (
-            !me.permissions.has(
-                PermissionsBitField.Flags.ManageRoles
-            )
-        ) {
-            return false;
-        }
-
-        const member =
-            await guild.members
-                .fetch(userId)
-                .catch(() => null);
-
-        if (!member) {
-            return false;
-        }
-
-        /*
-         * Discord's role hierarchy still applies.
-         */
-        const removable =
-            member.roles.cache.filter(
-                role =>
-                    role.id !== guild.id &&
-                    !role.managed &&
-                    role.position <
-                        me.roles.highest.position
-            );
-
-        if (!removable.size) {
-            return false;
-        }
-
-        await member.roles.remove(
-            removable,
-            "BK Security - limit exceeded"
-        );
-
-        return true;
-    } catch (error) {
-        console.error(
-            "[BK STRIP ERROR]",
-            error?.message || error
-        );
-
-        return false;
+    if (!botMember) {
+      return false;
     }
+
+    const manageableRoles =
+      member.roles.cache.filter(
+        (role) =>
+          role.id !== member.guild.id &&
+          !role.managed &&
+          role.position <
+            botMember.roles.highest.position
+      );
+
+    if (manageableRoles.size === 0) {
+      return false;
+    }
+
+    await member.roles.remove(
+      manageableRoles,
+      "BK Security | Security violation"
+    );
+
+    changed = true;
+  } catch (error) {
+    console.error(
+      "[BK] Failed to strip roles:",
+      error
+    );
+  }
+
+  return changed;
 }
 
 /* =========================================================
-   BAN
-========================================================= */
+   SAFE BAN
+   ========================================================= */
 
-async function safeBan(
-    guild,
-    userId,
-    reason
+async function safeBanMember(
+  guild,
+  member,
+  reason
 ) {
-    try {
-        if (
-            !guild ||
-            !userId
-        ) {
-            return false;
-        }
-
-        if (
-            isServerOwner(
-                guild,
-                userId
-            )
-        ) {
-            return false;
-        }
-
-        const me =
-            guild.members.me;
-
-        if (!me) {
-            return false;
-        }
-
-        if (
-            !me.permissions.has(
-                PermissionsBitField.Flags.BanMembers
-            )
-        ) {
-            console.error(
-                "[BK] Missing Ban Members permission."
-            );
-
-            return false;
-        }
-
-        const member =
-            await guild.members
-                .fetch(userId)
-                .catch(() => null);
-
-        if (member) {
-            if (
-                member.roles.highest.position >=
-                me.roles.highest.position
-            ) {
-                console.warn(
-                    `[BK] Cannot ban ${userId}; role hierarchy prevents it.`
-                );
-
-                return false;
-            }
-        }
-
-        await guild.members.ban(
-            userId,
-            {
-                reason: truncate(
-                    reason,
-                    500
-                )
-            }
-        );
-
-        return true;
-    } catch (error) {
-        console.error(
-            "[BK BAN ERROR]",
-            error?.message || error
-        );
-
-        return false;
+  try {
+    if (!member) {
+      return false;
     }
+
+    const botMember =
+      guild.members.me;
+
+    if (!botMember) {
+      return false;
+    }
+
+    if (
+      member.id === guild.ownerId
+    ) {
+      return false;
+    }
+
+    if (
+      member.roles.highest.position >=
+      botMember.roles.highest.position
+    ) {
+      return false;
+    }
+
+    if (!botMember.permissions.has(
+      PermissionsBitField.Flags.BanMembers
+    )) {
+      return false;
+    }
+
+    await member.ban({
+      reason
+    });
+
+    return true;
+  } catch (error) {
+    console.error(
+      "[BK] Failed to ban member:",
+      error
+    );
+
+    return false;
+  }
 }
 
 /* =========================================================
    PUNISHMENT
-========================================================= */
+   ========================================================= */
 
-async function enforceLimit(
+async function punishMember({
+  guild,
+  member,
+  action,
+  count,
+  limit
+}) {
+  if (!guild || !member) {
+    return;
+  }
+
+  const config =
+    getGuildConfig(guild.id);
+
+  const lockKey =
+    `${guild.id}:${member.id}:${action}`;
+
+  if (punishmentLocks.has(lockKey)) {
+    return;
+  }
+
+  punishmentLocks.add(lockKey);
+
+  try {
+    const reason =
+      `BK Security | ${action} limit exceeded | ${count} ${action}s within 60 seconds | User ID: ${member.id}`;
+
+    let stripped = false;
+    let banned = false;
+
+    if (
+      config.punishment === "strip" ||
+      config.punishment === "both"
+    ) {
+      stripped =
+        await stripDangerousRoles(member);
+    }
+
+    if (
+      config.punishment === "ban" ||
+      config.punishment === "both"
+    ) {
+      banned =
+        await safeBanMember(
+          guild,
+          member,
+          reason
+        );
+    }
+
+    const punishmentText =
+      config.punishment === "ban"
+        ? banned
+          ? "user banned"
+          : "ban failed"
+        : config.punishment === "strip"
+          ? stripped
+            ? "roles stripped"
+            : "role removal failed"
+          : `roles ${
+              stripped
+                ? "stripped"
+                : "not stripped"
+            } • ${
+              banned
+                ? "user banned"
+                : "ban failed"
+            }`;
+
+    const message =
+      responseSecurity([
+        "abnormal activity detected.",
+        "",
+        `user     → ${member.user?.tag || member.id}`,
+        `id       → ${member.id}`,
+        `action   → ${action}`,
+        `count    → ${count} / ${limit}`,
+        "",
+        `reason   → ${action} limit exceeded.`,
+        `action   → ${punishmentText}.`
+      ]);
+
+    await sendSecurityLog(
+      guild,
+      message
+    );
+  } finally {
+    setTimeout(() => {
+      punishmentLocks.delete(lockKey);
+    }, 5000);
+  }
+}
+
+/* =========================================================
+   LIMIT ENFORCEMENT
+   ========================================================= */
+
+async function enforceLimit({
+  guild,
+  member,
+  action
+}) {
+  if (!guild || !member) {
+    return false;
+  }
+
+  const config =
+    getGuildConfig(guild.id);
+
+  if (!config.enabled) {
+    return false;
+  }
+
+  if (
+    isServerOwner(member) ||
+    isWhitelisted(guild, member.id)
+  ) {
+    return false;
+  }
+
+  const limit =
+    config.limits[action];
+
+  if (
+    typeof limit !== "number"
+  ) {
+    return false;
+  }
+
+  const count =
+    registerAction(
+      guild.id,
+      member.id,
+      action
+    );
+
+  if (count > limit) {
+    await punishMember({
+      guild,
+      member,
+      action,
+      count,
+      limit
+    });
+
+    return true;
+  }
+
+  await sendSecurityLog(
     guild,
-    userId,
-    action,
-    count,
-    limit
+    createBox(
+      `✓ ${action.toUpperCase()}`,
+      [
+        `${member.user?.tag || member.id} performed ${action}.`,
+        "",
+        `security → within limit`,
+        `count    → ${count} / ${limit}`,
+        `status   → allowed`
+      ],
+      "BK • SECURITY"
+    )
+  );
+
+  return false;
+}
+
+/* =========================================================
+   HELP PAGES
+   ========================================================= */
+
+const HELP_PAGES = [
+  {
+    title: "BK SECURITY",
+    lines: [
+      "strict server protection.",
+      "",
+      "protect your server",
+      "from unauthorized actions.",
+      "",
+      "pages → 1 / 5"
+    ]
+  },
+
+  {
+    title: "BK • SECURITY",
+    lines: [
+      "!security setup",
+      "!security status",
+      "!security enable",
+      "!security disable",
+      "",
+      "configure BK security.",
+      "",
+      "pages → 2 / 5"
+    ]
+  },
+
+  {
+    title: "BK • LIMITS",
+    lines: [
+      "!security limit ban 3",
+      "!security limit kick 5",
+      "!security limit role 5",
+      "!security limit channel 3",
+      "",
+      "limits reset every 60 seconds.",
+      "",
+      "pages → 3 / 5"
+    ]
+  },
+
+  {
+    title: "BK • WHITELIST",
+    lines: [
+      "!wl add @user",
+      "!wl remove @user",
+      "!wl list",
+      "",
+      "whitelisted users bypass",
+      "security enforcement.",
+      "",
+      "pages → 4 / 5"
+    ]
+  },
+
+  {
+    title: "BK • ACTIONS",
+    lines: [
+      "!security punishment ban",
+      "!security punishment strip",
+      "!security punishment both",
+      "",
+      "!security logs #channel",
+      "",
+      "configure BK actions.",
+      "",
+      "pages → 5 / 5"
+    ]
+  }
+];
+
+function createHelpBox(page = 0) {
+  const data =
+    HELP_PAGES[page] ||
+    HELP_PAGES[0];
+
+  return createBox(
+    data.title,
+    data.lines,
+    `BK • PAGE ${page + 1}/${HELP_PAGES.length}`
+  );
+}
+
+function createHelpButtons(
+  page,
+  ownerId
 ) {
-    if (!guild || !userId) {
-        return;
+  const previous =
+    new ButtonBuilder()
+      .setCustomId(
+        `bk_help_prev_${ownerId}_${page}`
+      )
+      .setLabel("‹")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page === 0);
+
+  const home =
+    new ButtonBuilder()
+      .setCustomId(
+        `bk_help_home_${ownerId}_${page}`
+      )
+      .setLabel("Home")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page === 0);
+
+  const next =
+    new ButtonBuilder()
+      .setCustomId(
+        `bk_help_next_${ownerId}_${page}`
+      )
+      .setLabel("›")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(
+        page === HELP_PAGES.length - 1
+      );
+
+  return new ActionRowBuilder()
+    .addComponents(
+      previous,
+      home,
+      next
+    );
+}
+
+/* =========================================================
+   HELP COMMAND
+   ========================================================= */
+
+async function sendHelp(message) {
+  await safeSend(
+    message.channel,
+    {
+      content: createHelpBox(0),
+      components: [
+        createHelpButtons(
+          0,
+          message.author.id
+        )
+      ]
     }
+  );
+}
 
-    const lockKey =
-        `${guild.id}:${userId}:${action}`;
+/* =========================================================
+   MESSAGE COMMAND HANDLER
+   ========================================================= */
 
-    /*
-     * Prevent multiple simultaneous punishments.
-     */
-    if (punishmentLocks.has(lockKey)) {
-        return;
-    }
-
-    punishmentLocks.add(lockKey);
-
+client.on(
+  "messageCreate",
+  async (message) => {
     try {
+      if (!message.guild) {
+        return;
+      }
+
+      if (message.author.bot) {
+        return;
+      }
+
+      if (
+        !message.content.startsWith(PREFIX)
+      ) {
+        return;
+      }
+
+      const args =
+        message.content
+          .slice(PREFIX.length)
+          .trim()
+          .split(/\s+/);
+
+      const command =
+        args.shift()?.toLowerCase();
+
+      if (!command) {
+        return;
+      }
+
+      /* ================================================
+         HELP
+         ================================================ */
+
+      if (command === "help") {
+        await sendHelp(message);
+        return;
+      }
+
+      /* ================================================
+         WHITELIST
+         ================================================ */
+
+      if (
+        command === "wl" ||
+        command === "whitelist"
+      ) {
         if (
-            isServerOwner(
-                guild,
-                userId
-            )
+          !canManageSecurity(
+            message.member
+          )
         ) {
-            return;
+          await safeSend(
+            message.channel,
+            responseError([
+              `${message.author} cannot use this command.`,
+              "",
+              "required → Administrator",
+              "status   → denied"
+            ])
+          );
+
+          return;
         }
 
-        if (
-            isBKWhitelisted(
-                guild,
-                userId
-            )
-        ) {
-            return;
-        }
+        const sub =
+          args[0]?.toLowerCase();
 
         const config =
-            getGuildConfig(guild.id);
+          getGuildConfig(
+            message.guild.id
+          );
 
-        const reason =
-            `BK Security | ${action} limit exceeded | ` +
-            `${count}/${limit} in 60 seconds | ` +
-            `User ID: ${userId}`;
-
-        let stripped = false;
-        let banned = false;
-
-        if (
-            config.punishment ===
-                "strip" ||
-            config.punishment ===
-                "both"
-        ) {
-            stripped =
-                await stripDangerousRoles(
-                    guild,
-                    userId
-                );
-        }
-
-        if (
-            config.punishment ===
-                "ban" ||
-            config.punishment ===
-                "both"
-        ) {
-            banned =
-                await safeBan(
-                    guild,
-                    userId,
-                    reason
-                );
-        }
-
-        clearUserCounters(
-            guild.id,
-            userId
-        );
-
-        const actions = [];
-
-        if (stripped) {
-            actions.push(
-                "roles stripped"
-            );
-        }
-
-        if (banned) {
-            actions.push(
-                "user banned"
-            );
-        }
-
-        if (!actions.length) {
-            actions.push(
-                "punishment failed"
-            );
-        }
-
-        const message =
-            makeBox(
-                "⚠ BK SECURITY",
+        if (sub === "list") {
+          if (
+            config.whitelist.length === 0
+          ) {
+            await safeSend(
+              message.channel,
+              responseInfo(
+                "TRUST",
                 [
-                    "",
-                    "abnormal activity detected.",
-                    "",
-                    `user → ${userId}`,
-                    `action → ${action}`,
-                    `count → ${count}/${limit}`,
-                    "",
-                    `reason → ${action} limit exceeded`,
-                    `action → ${actions.join(" + ")}`
+                  "no users are BK-whitelisted.",
+                  "",
+                  "use → !wl add @user"
                 ]
+              )
             );
 
-        await securityLog(
-            guild,
-            message
-        );
-    } catch (error) {
-        console.error(
-            "[BK ENFORCEMENT ERROR]",
-            error?.message || error
-        );
-    } finally {
-        /*
-         * Always release the lock.
-         */
-        punishmentLocks.delete(
-            lockKey
-        );
-    }
-}
-
-/* =========================================================
-   MONITOR ACTION
-========================================================= */
-
-async function monitorAction(
-    guild,
-    executorId,
-    action
-) {
-    try {
-        if (
-            !guild ||
-            !executorId
-        ) {
             return;
-        }
+          }
 
-        if (
-            !VALID_ACTIONS.has(
-                action
+          const users = [];
+
+          for (
+            const id of config.whitelist
+          ) {
+            const member =
+              await message.guild.members
+                .fetch(id)
+                .catch(() => null);
+
+            users.push(
+              member
+                ? `${member.user.tag} → ${id}`
+                : `unknown user → ${id}`
+            );
+          }
+
+          await safeSend(
+            message.channel,
+            responseInfo(
+              "TRUST",
+              [
+                "BK whitelist",
+                "",
+                ...users.slice(0, 8)
+              ]
             )
-        ) {
-            return;
+          );
+
+          return;
         }
 
-        /*
-         * Never punish BK.
-         */
+        const target =
+          message.mentions.members.first();
+
         if (
-            client.user &&
-            executorId ===
-                client.user.id
+          !target &&
+          (sub === "add" ||
+            sub === "remove")
         ) {
-            return;
+          await safeSend(
+            message.channel,
+            responseError([
+              "you must mention a user.",
+              "",
+              "example → !wl add @user"
+            ])
+          );
+
+          return;
         }
 
-        /*
-         * Owner is always exempt.
-         */
-        if (
-            isServerOwner(
-                guild,
-                executorId
+        if (sub === "add") {
+          if (
+            target.id ===
+            message.guild.ownerId
+          ) {
+            await safeSend(
+              message.channel,
+              responseInfo(
+                "TRUST",
+                [
+                  "the server owner is",
+                  "already protected by BK."
+                ]
+              )
+            );
+
+            return;
+          }
+
+          if (
+            !config.whitelist.includes(
+              target.id
             )
-        ) {
-            return;
-        }
+          ) {
+            config.whitelist.push(
+              target.id
+            );
 
-        /*
-         * Whitelisted users bypass
-         * automatic punishment.
-         */
-        if (
-            isBKWhitelisted(
-                guild,
-                executorId
+            saveDatabase();
+          }
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "TRUST",
+              [
+                `${target} is BK-whitelisted.`,
+                "security enforcement bypassed.",
+                "actions will remain logged."
+              ]
             )
-        ) {
-            return;
+          );
+
+          return;
         }
 
-        const config =
-            getGuildConfig(
-                guild.id
+        if (sub === "remove") {
+          config.whitelist =
+            config.whitelist.filter(
+              (id) =>
+                id !== target.id
             );
 
-        if (!config.enabled) {
-            return;
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "TRUST",
+              [
+                `${target} was removed`,
+                "from the BK whitelist.",
+                "security enforcement restored."
+              ]
+            )
+          );
+
+          return;
         }
 
-        const limit =
-            Number(
-                config.limits[action]
-            );
-
-        if (
-            !Number.isInteger(limit) ||
-            limit < 1
-        ) {
-            return;
-        }
-
-        const count =
-            addAction(
-                guild.id,
-                executorId,
-                action
-            );
-
-        /*
-         * Normal activity.
-         */
-        if (count <= limit) {
-            return;
-        }
-
-        await enforceLimit(
-            guild,
-            executorId,
-            action,
-            count,
-            limit
-        );
-    } catch (error) {
-        console.error(
-            "[BK MONITOR ERROR]",
-            error?.message || error
-        );
-    }
-}
-
-/* =========================================================
-   BAN EVENT
-========================================================= */
-
-client.on(
-    "guildBanAdd",
-    async ban => {
-        try {
-            if (!ban?.guild) {
-                return;
-            }
-
-            const executorId =
-                await findExecutor(
-                    ban.guild,
-                    AuditLogEvent.MemberBanAdd,
-                    ban.user?.id
-                );
-
-            /*
-             * NEVER guess.
-             */
-            if (!executorId) {
-                return;
-            }
-
-            const eventKey =
-                `ban:${ban.guild.id}:${ban.user.id}:${executorId}`;
-
-            if (
-                eventWasProcessed(
-                    eventKey
-                )
-            ) {
-                return;
-            }
-
-            await monitorAction(
-                ban.guild,
-                executorId,
-                "ban"
-            );
-        } catch (error) {
-            console.error(
-                "[BK BAN EVENT ERROR]",
-                error?.message || error
-            );
-        }
-    }
-);
-
-/* =========================================================
-   KICK EVENT
-========================================================= */
-
-client.on(
-    "guildMemberRemove",
-    async member => {
-        try {
-            if (!member?.guild) {
-                return;
-            }
-
-            const executorId =
-                await findExecutor(
-                    member.guild,
-                    AuditLogEvent.MemberKick,
-                    member.id
-                );
-
-            /*
-             * A normal leave has no kick audit entry.
-             */
-            if (!executorId) {
-                return;
-            }
-
-            const eventKey =
-                `kick:${member.guild.id}:${member.id}:${executorId}`;
-
-            if (
-                eventWasProcessed(
-                    eventKey
-                )
-            ) {
-                return;
-            }
-
-            await monitorAction(
-                member.guild,
-                executorId,
-                "kick"
-            );
-        } catch (error) {
-            console.error(
-                "[BK KICK EVENT ERROR]",
-                error?.message || error
-            );
-        }
-    }
-);
-
-/* =========================================================
-   ROLE DELETE
-========================================================= */
-
-client.on(
-    "roleDelete",
-    async role => {
-        try {
-            if (!role?.guild) {
-                return;
-            }
-
-            const executorId =
-                await findExecutor(
-                    role.guild,
-                    AuditLogEvent.RoleDelete,
-                    role.id
-                );
-
-            if (!executorId) {
-                return;
-            }
-
-            const eventKey =
-                `role:${role.guild.id}:${role.id}:${executorId}`;
-
-            if (
-                eventWasProcessed(
-                    eventKey
-                )
-            ) {
-                return;
-            }
-
-            await monitorAction(
-                role.guild,
-                executorId,
-                "role"
-            );
-        } catch (error) {
-            console.error(
-                "[BK ROLE EVENT ERROR]",
-                error?.message || error
-            );
-        }
-    }
-);
-
-/* =========================================================
-   CHANNEL DELETE
-========================================================= */
-
-client.on(
-    "channelDelete",
-    async channel => {
-        try {
-            if (!channel?.guild) {
-                return;
-            }
-
-            const executorId =
-                await findExecutor(
-                    channel.guild,
-                    AuditLogEvent.ChannelDelete,
-                    channel.id
-                );
-
-            if (!executorId) {
-                return;
-            }
-
-            const eventKey =
-                `channel:${channel.guild.id}:${channel.id}:${executorId}`;
-
-            if (
-                eventWasProcessed(
-                    eventKey
-                )
-            ) {
-                return;
-            }
-
-            await monitorAction(
-                channel.guild,
-                executorId,
-                "channel"
-            );
-        } catch (error) {
-            console.error(
-                "[BK CHANNEL EVENT ERROR]",
-                error?.message || error
-            );
-        }
-    }
-);
-
-/* =========================================================
-   WEBHOOK UPDATE / CREATE / DELETE MONITOR
-========================================================= */
-
-client.on(
-    "webhooksUpdate",
-    async channel => {
-        try {
-            if (!channel?.guild) {
-                return;
-            }
-
-            /*
-             * Discord's webhooksUpdate event does not tell us
-             * which webhook action happened.
-             *
-             * We therefore inspect the recent audit log and
-             * only count a verified webhook action.
-             */
-            const auditTypes = [
-                AuditLogEvent.WebhookCreate,
-                AuditLogEvent.WebhookUpdate,
-                AuditLogEvent.WebhookDelete
-            ];
-
-            for (const type of auditTypes) {
-                const executorId =
-                    await findExecutor(
-                        channel.guild,
-                        type,
-                        null
-                    );
-
-                if (!executorId) {
-                    continue;
-                }
-
-                const eventKey =
-                    `webhook:${channel.guild.id}:${executorId}:${type}`;
-
-                if (
-                    eventWasProcessed(
-                        eventKey
-                    )
-                ) {
-                    continue;
-                }
-
-                await monitorAction(
-                    channel.guild,
-                    executorId,
-                    "webhook"
-                );
-
-                break;
-            }
-        } catch (error) {
-            console.error(
-                "[BK WEBHOOK EVENT ERROR]",
-                error?.message || error
-            );
-        }
-    }
-);
-
-/* =========================================================
-   COMMAND HELP
-========================================================= */
-
-function helpMessage() {
-    return makeBox(
-        "BK SECURITY",
-        [
-            "",
-            "!help",
-            "show this panel",
+        await safeSend(
+          message.channel,
+          responseError([
+            "unknown whitelist command.",
             "",
             "!wl add @user",
-            "whitelist user",
-            "",
             "!wl remove @user",
-            "remove whitelist",
-            "",
-            "!wl list",
-            "show whitelist",
-            "",
-            "!security setup",
-            "enable + configure BK",
-            "",
-            "!security status",
-            "show protection status",
-            "",
-            "!security enable",
-            "enable protection",
-            "",
-            "!security disable",
-            "disable protection",
-            "",
-            "!security limit ban 3",
-            "set ban limit",
-            "",
-            "!security limit kick 5",
-            "set kick limit",
-            "",
-            "!security punishment ban",
-            "set punishment",
-            "",
-            "!security logs #channel",
-            "set security logs"
-        ]
-    );
-}
+            "!wl list"
+          ])
+        );
 
-/* =========================================================
-   COMMAND PERMISSION ERROR
-========================================================= */
+        return;
+      }
 
-async function sendPermissionError(
-    channel,
-    user
-) {
-    await safeSend(
-        channel,
-        makeBox(
-            "⚠ ERROR",
-            [
+      /* ================================================
+         SECURITY
+         ================================================ */
+
+      if (command === "security") {
+        if (
+          !canManageSecurity(
+            message.member
+          )
+        ) {
+          await safeSend(
+            message.channel,
+            responseError([
+              `${message.author} cannot use this command.`,
+              "",
+              "required → Administrator",
+              "status   → denied"
+            ])
+          );
+
+          return;
+        }
+
+        const sub =
+          args[0]?.toLowerCase();
+
+        const config =
+          getGuildConfig(
+            message.guild.id
+          );
+
+        /* ============================================
+           SETUP
+           ============================================ */
+
+        if (sub === "setup") {
+          config.enabled = true;
+
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "SETUP",
+              [
+                "BK security has been configured.",
                 "",
-                `${user.username}`,
-                "you are not authorized.",
+                "status → enabled",
+                "limits → default",
+                "punishment → ban",
                 "",
-                "required → server owner"
-            ]
-        )
-    );
-}
-
-/* =========================================================
-   COMMAND HANDLER
-========================================================= */
-
-client.on(
-    "messageCreate",
-    async message => {
-        /*
-         * This entire event is isolated.
-         * A command error cannot kill BK.
-         */
-        try {
-            if (
-                !message ||
-                message.author?.bot ||
-                !message.guild
-            ) {
-                return;
-            }
-
-            const content =
-                safeString(
-                    message.content,
-                    ""
-                );
-
-            if (
-                !content.startsWith(
-                    PREFIX
-                )
-            ) {
-                return;
-            }
-
-            const parts =
-                content
-                    .slice(PREFIX.length)
-                    .trim()
-                    .split(/\s+/)
-                    .filter(Boolean);
-
-            const command =
-                parts
-                    .shift()
-                    ?.toLowerCase();
-
-            if (!command) {
-                return;
-            }
-
-            /* =============================================
-               HELP
-            ============================================= */
-
-            if (
-                command === "help" ||
-                command === "h"
-            ) {
-                await safeSend(
-                    message.channel,
-                    helpMessage()
-                );
-
-                return;
-            }
-
-            /* =============================================
-               WHITELIST
-            ============================================= */
-
-            if (
-                command === "wl" ||
-                command === "whitelist"
-            ) {
-                if (
-                    !canConfigureBK(
-                        message.guild,
-                        message.author.id
-                    )
-                ) {
-                    await sendPermissionError(
-                        message.channel,
-                        message.author
-                    );
-
-                    return;
-                }
-
-                const subcommand =
-                    parts
-                        .shift()
-                        ?.toLowerCase();
-
-                const config =
-                    getGuildConfig(
-                        message.guild.id
-                    );
-
-                /* LIST */
-
-                if (
-                    subcommand === "list"
-                ) {
-                    if (
-                        config.whitelist.length ===
-                        0
-                    ) {
-                        await safeSend(
-                            message.channel,
-                            makeBox(
-                                "BK WHITELIST",
-                                [
-                                    "",
-                                    "no users whitelisted."
-                                ]
-                            )
-                        );
-
-                        return;
-                    }
-
-                    const lines = [
-                        "",
-                        `users → ${config.whitelist.length}`,
-                        ""
-                    ];
-
-                    for (
-                        const id
-                        of config.whitelist.slice(
-                            0,
-                            15
-                        )
-                    ) {
-                        lines.push(
-                            `• ${id}`
-                        );
-                    }
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "BK WHITELIST",
-                            lines
-                        )
-                    );
-
-                    return;
-                }
-
-                /* ADD / REMOVE */
-
-                const target =
-                    message.mentions.users.first();
-
-                if (!target) {
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "⚠ ERROR",
-                            [
-                                "",
-                                "mention a user.",
-                                "",
-                                "!wl add @user",
-                                "!wl remove @user"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                if (
-                    subcommand === "add"
-                ) {
-                    if (
-                        !config.whitelist.includes(
-                            target.id
-                        )
-                    ) {
-                        config.whitelist.push(
-                            target.id
-                        );
-
-                        saveDatabase();
-                    }
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ BK WHITELIST",
-                            [
-                                "",
-                                `user → ${target.username}`,
-                                `id → ${target.id}`,
-                                "",
-                                "status → trusted"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                if (
-                    subcommand === "remove"
-                ) {
-                    config.whitelist =
-                        config.whitelist.filter(
-                            id =>
-                                id !==
-                                target.id
-                        );
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ BK WHITELIST",
-                            [
-                                "",
-                                `user → ${target.username}`,
-                                `id → ${target.id}`,
-                                "",
-                                "status → removed"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                await safeSend(
-                    message.channel,
-                    makeBox(
-                        "⚠ ERROR",
-                        [
-                            "",
-                            "unknown whitelist command.",
-                            "",
-                            "!wl add @user",
-                            "!wl remove @user",
-                            "!wl list"
-                        ]
-                    )
-                );
-
-                return;
-            }
-
-            /* =============================================
-               SECURITY
-            ============================================= */
-
-            if (
-                command === "security"
-            ) {
-                const subcommand =
-                    parts
-                        .shift()
-                        ?.toLowerCase();
-
-                const config =
-                    getGuildConfig(
-                        message.guild.id
-                    );
-
-                /* STATUS IS SAFE FOR EVERYONE */
-
-                if (
-                    subcommand ===
-                    "status"
-                ) {
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "BK SECURITY",
-                            [
-                                "",
-                                `status → ${config.enabled ? "enabled" : "disabled"}`,
-                                `punishment → ${config.punishment}`,
-                                "",
-                                `ban → ${config.limits.ban}/60s`,
-                                `kick → ${config.limits.kick}/60s`,
-                                `role → ${config.limits.role}/60s`,
-                                `channel → ${config.limits.channel}/60s`,
-                                `webhook → ${config.limits.webhook}/60s`,
-                                "",
-                                `whitelist → ${config.whitelist.length}`
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                /*
-                 * Everything below this point modifies
-                 * BK's security configuration.
-                 */
-                if (
-                    !canConfigureBK(
-                        message.guild,
-                        message.author.id
-                    )
-                ) {
-                    await sendPermissionError(
-                        message.channel,
-                        message.author
-                    );
-
-                    return;
-                }
-
-                /* SETUP */
-
-                if (
-                    subcommand ===
-                    "setup"
-                ) {
-                    config.enabled = true;
-                    config.logChannelId =
-                        message.channel.id;
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ BK SECURITY",
-                            [
-                                "",
-                                "protection enabled.",
-                                "",
-                                "anti-ban → active",
-                                "anti-kick → active",
-                                "anti-role → active",
-                                "anti-channel → active",
-                                "anti-webhook → active",
-                                "whitelist → active",
-                                "",
-                                "logs → this channel"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                /* ENABLE */
-
-                if (
-                    subcommand ===
-                    "enable"
-                ) {
-                    config.enabled = true;
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ BK SECURITY",
-                            [
-                                "",
-                                "protection enabled.",
-                                "",
-                                "BK is monitoring."
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                /* DISABLE */
-
-                if (
-                    subcommand ===
-                    "disable"
-                ) {
-                    config.enabled = false;
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "⚠ BK SECURITY",
-                            [
-                                "",
-                                "protection disabled.",
-                                "",
-                                "BK is not enforcing limits."
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                /* LIMIT */
-
-                if (
-                    subcommand ===
-                    "limit"
-                ) {
-                    const action =
-                        parts
-                            .shift()
-                            ?.toLowerCase();
-
-                    const value =
-                        Number(
-                            parts.shift()
-                        );
-
-                    if (
-                        !VALID_ACTIONS.has(
-                            action
-                        ) ||
-                        !Number.isInteger(
-                            value
-                        ) ||
-                        value < 1 ||
-                        value > 100
-                    ) {
-                        await safeSend(
-                            message.channel,
-                            makeBox(
-                                "⚠ ERROR",
-                                [
-                                    "",
-                                    "invalid limit.",
-                                    "",
-                                    "!security limit ban 3",
-                                    "!security limit kick 5",
-                                    "!security limit role 5"
-                                ]
-                            )
-                        );
-
-                        return;
-                    }
-
-                    config.limits[action] =
-                        value;
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ SECURITY LIMIT",
-                            [
-                                "",
-                                `action → ${action}`,
-                                `limit → ${value}/60s`,
-                                "",
-                                "status → updated"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                /* PUNISHMENT */
-
-                if (
-                    subcommand ===
-                    "punishment"
-                ) {
-                    const punishment =
-                        parts
-                            .shift()
-                            ?.toLowerCase();
-
-                    if (
-                        !VALID_PUNISHMENTS.has(
-                            punishment
-                        )
-                    ) {
-                        await safeSend(
-                            message.channel,
-                            makeBox(
-                                "⚠ ERROR",
-                                [
-                                    "",
-                                    "invalid punishment.",
-                                    "",
-                                    "ban",
-                                    "strip",
-                                    "both"
-                                ]
-                            )
-                        );
-
-                        return;
-                    }
-
-                    config.punishment =
-                        punishment;
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ BK SECURITY",
-                            [
-                                "",
-                                `punishment → ${punishment}`,
-                                "status → updated"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                /* LOGS */
-
-                if (
-                    subcommand ===
-                    "logs"
-                ) {
-                    const channel =
-                        message.mentions.channels.first();
-
-                    if (!channel) {
-                        await safeSend(
-                            message.channel,
-                            makeBox(
-                                "⚠ ERROR",
-                                [
-                                    "",
-                                    "mention a channel.",
-                                    "",
-                                    "!security logs #security"
-                                ]
-                            )
-                        );
-
-                        return;
-                    }
-
-                    config.logChannelId =
-                        channel.id;
-
-                    saveDatabase();
-
-                    await safeSend(
-                        message.channel,
-                        makeBox(
-                            "✓ BK LOGS",
-                            [
-                                "",
-                                `channel → ${channel.name}`,
-                                "status → enabled"
-                            ]
-                        )
-                    );
-
-                    return;
-                }
-
-                await safeSend(
-                    message.channel,
-                    makeBox(
-                        "⚠ ERROR",
-                        [
-                            "",
-                            "unknown security command.",
-                            "",
-                            "!security setup",
-                            "!security status",
-                            "!security enable",
-                            "!security disable",
-                            "!security limit",
-                            "!security punishment",
-                            "!security logs"
-                        ]
-                    )
-                );
-            }
-        } catch (error) {
-            console.error(
-                "[BK COMMAND ERROR]",
-                error
+                "use → !security status"
+              ]
+            )
+          );
+
+          return;
+        }
+
+        /* ============================================
+           STATUS
+           ============================================ */
+
+        if (sub === "status") {
+          await safeSend(
+            message.channel,
+            responseInfo(
+              "STATUS",
+              [
+                `security → ${
+                  config.enabled
+                    ? "enabled"
+                    : "disabled"
+                }`,
+                `ban      → ${config.limits.ban}`,
+                `kick     → ${config.limits.kick}`,
+                `role     → ${config.limits.role}`,
+                `channel  → ${config.limits.channel}`,
+                `webhook  → ${config.limits.webhook}`,
+                `punish   → ${config.punishment}`,
+                `whitelist → ${config.whitelist.length}`
+              ]
+            )
+          );
+
+          return;
+        }
+
+        /* ============================================
+           ENABLE
+           ============================================ */
+
+        if (sub === "enable") {
+          config.enabled = true;
+
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "SECURITY",
+              [
+                "BK security is now enabled.",
+                "",
+                "status → active",
+                "protection → enabled"
+              ]
+            )
+          );
+
+          return;
+        }
+
+        /* ============================================
+           DISABLE
+           ============================================ */
+
+        if (sub === "disable") {
+          config.enabled = false;
+
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseInfo(
+              "SECURITY",
+              [
+                "BK security is now disabled.",
+                "",
+                "status → inactive",
+                "protection → disabled"
+              ]
+            )
+          );
+
+          return;
+        }
+
+        /* ============================================
+           LIMIT
+           ============================================ */
+
+        if (sub === "limit") {
+          const action =
+            args[1]?.toLowerCase();
+
+          const amount =
+            Number(args[2]);
+
+          const validActions = [
+            "ban",
+            "kick",
+            "role",
+            "channel",
+            "webhook"
+          ];
+
+          if (
+            !validActions.includes(
+              action
+            )
+          ) {
+            await safeSend(
+              message.channel,
+              responseError([
+                "invalid security limit.",
+                "",
+                "valid → ban",
+                "valid → kick",
+                "valid → role",
+                "valid → channel",
+                "valid → webhook"
+              ])
             );
 
-            /*
-             * Last line of defense for this command.
-             */
-            try {
-                await safeSend(
-                    message.channel,
-                    makeBox(
-                        "⚠ BK ERROR",
-                        [
-                            "",
-                            "the command failed.",
-                            "",
-                            "BK remains online."
-                        ]
-                    )
-                );
-            } catch {}
+            return;
+          }
+
+          if (
+            !Number.isInteger(amount) ||
+            amount < 1 ||
+            amount > 100
+          ) {
+            await safeSend(
+              message.channel,
+              responseError([
+                "invalid limit amount.",
+                "",
+                "use a number between 1 and 100."
+              ])
+            );
+
+            return;
+          }
+
+          config.limits[action] =
+            amount;
+
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "LIMIT",
+              [
+                `action → ${action}`,
+                `limit  → ${amount}`,
+                "",
+                "window → 60 seconds",
+                "status → saved"
+              ]
+            )
+          );
+
+          return;
         }
+
+        /* ============================================
+           PUNISHMENT
+           ============================================ */
+
+        if (sub === "punishment") {
+          const punishment =
+            args[1]?.toLowerCase();
+
+          if (
+            ![
+              "ban",
+              "strip",
+              "both"
+            ].includes(punishment)
+          ) {
+            await safeSend(
+              message.channel,
+              responseError([
+                "invalid punishment.",
+                "",
+                "valid → ban",
+                "valid → strip",
+                "valid → both"
+              ])
+            );
+
+            return;
+          }
+
+          config.punishment =
+            punishment;
+
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "ACTION",
+              [
+                `punishment → ${punishment}`,
+                "status → saved"
+              ]
+            )
+          );
+
+          return;
+        }
+
+        /* ============================================
+           LOG CHANNEL
+           ============================================ */
+
+        if (sub === "logs") {
+          const channel =
+            message.mentions.channels.first();
+
+          if (
+            !channel
+          ) {
+            await safeSend(
+              message.channel,
+              responseError([
+                "you must mention a channel.",
+                "",
+                "example → !security logs #security"
+              ])
+            );
+
+            return;
+          }
+
+          config.logChannelId =
+            channel.id;
+
+          saveDatabase();
+
+          await safeSend(
+            message.channel,
+            responseSuccess(
+              "LOGS",
+              [
+                `channel → ${channel}`,
+                "security events will be logged.",
+                "status → enabled"
+              ]
+            )
+          );
+
+          return;
+        }
+
+        await safeSend(
+          message.channel,
+          responseError([
+            "unknown security command.",
+            "",
+            "!security setup",
+            "!security status",
+            "!security enable",
+            "!security disable",
+            "!security limit",
+            "!security punishment",
+            "!security logs"
+          ])
+        );
+
+        return;
+      }
+    } catch (error) {
+      console.error(
+        "[BK] messageCreate error:",
+        error
+      );
+
+      await safeSend(
+        message.channel,
+        responseError([
+          "an internal error occurred.",
+          "",
+          "status → command failed",
+          "BK remains online."
+        ])
+      );
     }
+  }
+);
+
+/* =========================================================
+   HELP BUTTONS
+   ========================================================= */
+
+client.on(
+  "interactionCreate",
+  async (interaction) => {
+    try {
+      if (
+        !interaction.isButton()
+      ) {
+        return;
+      }
+
+      if (
+        !interaction.customId.startsWith(
+          "bk_help_"
+        )
+      ) {
+        return;
+      }
+
+      const parts =
+        interaction.customId.split("_");
+
+      /*
+        bk_help_next_USERID_PAGE
+        bk_help_prev_USERID_PAGE
+        bk_help_home_USERID_PAGE
+      */
+
+      const action =
+        parts[2];
+
+      const ownerId =
+        parts[3];
+
+      const currentPage =
+        Number(parts[4]);
+
+      if (
+        interaction.user.id !==
+        ownerId
+      ) {
+        await interaction.reply({
+          content: responseError([
+            "this help panel belongs",
+            "to another user.",
+            "",
+            "status → access denied"
+          ]),
+          ephemeral: true
+        });
+
+        return;
+      }
+
+      if (
+        Number.isNaN(currentPage)
+      ) {
+        await interaction.reply({
+          content: responseError([
+            "invalid help page.",
+            "",
+            "status → request rejected"
+          ]),
+          ephemeral: true
+        });
+
+        return;
+      }
+
+      let newPage =
+        currentPage;
+
+      if (action === "next") {
+        newPage++;
+      }
+
+      if (action === "prev") {
+        newPage--;
+      }
+
+      if (action === "home") {
+        newPage = 0;
+      }
+
+      newPage =
+        Math.max(
+          0,
+          Math.min(
+            HELP_PAGES.length - 1,
+            newPage
+          )
+        );
+
+      await interaction.update({
+        content:
+          createHelpBox(newPage),
+
+        components: [
+          createHelpButtons(
+            newPage,
+            ownerId
+          )
+        ]
+      });
+    } catch (error) {
+      console.error(
+        "[BK] interaction error:",
+        error
+      );
+
+      try {
+        if (
+          !interaction.replied &&
+          !interaction.deferred
+        ) {
+          await interaction.reply({
+            content: responseError([
+              "the button could not be processed.",
+              "",
+              "status → request failed"
+            ]),
+            ephemeral: true
+          });
+        }
+      } catch {}
+    }
+  }
+);
+
+/* =========================================================
+   BAN MONITOR
+   ========================================================= */
+
+client.on(
+  "guildBanAdd",
+  async (ban) => {
+    try {
+      const guild =
+        ban.guild;
+
+      if (!guild) {
+        return;
+      }
+
+      const config =
+        getGuildConfig(guild.id);
+
+      if (!config.enabled) {
+        return;
+      }
+
+      const entry =
+        await findAuditExecutor(
+          guild,
+          AuditLogEvent.MemberBanAdd,
+          ban.user.id
+        );
+
+      if (!entry?.executorId) {
+        return;
+      }
+
+      const executor =
+        await guild.members
+          .fetch(entry.executorId)
+          .catch(() => null);
+
+      if (!executor) {
+        return;
+      }
+
+      if (
+        isServerOwner(executor) ||
+        isWhitelisted(
+          guild,
+          executor.id
+        )
+      ) {
+        return;
+      }
+
+      await enforceLimit({
+        guild,
+        member: executor,
+        action: "ban"
+      });
+    } catch (error) {
+      console.error(
+        "[BK] guildBanAdd error:",
+        error
+      );
+    }
+  }
+);
+
+/* =========================================================
+   KICK MONITOR
+   ========================================================= */
+
+client.on(
+  "guildMemberRemove",
+  async (member) => {
+    try {
+      const guild =
+        member.guild;
+
+      const entry =
+        await findAuditExecutor(
+          guild,
+          AuditLogEvent.MemberKick,
+          member.id
+        );
+
+      if (!entry?.executorId) {
+        return;
+      }
+
+      const executor =
+        await guild.members
+          .fetch(entry.executorId)
+          .catch(() => null);
+
+      if (!executor) {
+        return;
+      }
+
+      if (
+        isServerOwner(executor) ||
+        isWhitelisted(
+          guild,
+          executor.id
+        )
+      ) {
+        return;
+      }
+
+      await enforceLimit({
+        guild,
+        member: executor,
+        action: "kick"
+      });
+    } catch (error) {
+      console.error(
+        "[BK] guildMemberRemove error:",
+        error
+      );
+    }
+  }
+);
+
+/* =========================================================
+   ROLE DELETE MONITOR
+   ========================================================= */
+
+client.on(
+  "roleDelete",
+  async (role) => {
+    try {
+      const guild =
+        role.guild;
+
+      const eventKey =
+        `role:${guild.id}:${role.id}`;
+
+      if (
+        processedEvents.has(eventKey)
+      ) {
+        return;
+      }
+
+      processedEvents.add(
+        eventKey
+      );
+
+      setTimeout(() => {
+        processedEvents.delete(
+          eventKey
+        );
+      }, 30_000);
+
+      const entry =
+        await findAuditExecutor(
+          guild,
+          AuditLogEvent.RoleDelete,
+          role.id
+        );
+
+      if (!entry?.executorId) {
+        return;
+      }
+
+      const executor =
+        await guild.members
+          .fetch(entry.executorId)
+          .catch(() => null);
+
+      if (!executor) {
+        return;
+      }
+
+      if (
+        isServerOwner(executor) ||
+        isWhitelisted(
+          guild,
+          executor.id
+        )
+      ) {
+        return;
+      }
+
+      await enforceLimit({
+        guild,
+        member: executor,
+        action: "role"
+      });
+    } catch (error) {
+      console.error(
+        "[BK] roleDelete error:",
+        error
+      );
+    }
+  }
+);
+
+/* =========================================================
+   CHANNEL DELETE MONITOR
+   ========================================================= */
+
+client.on(
+  "channelDelete",
+  async (channel) => {
+    try {
+      if (!channel.guild) {
+        return;
+      }
+
+      const guild =
+        channel.guild;
+
+      const eventKey =
+        `channel:${guild.id}:${channel.id}`;
+
+      if (
+        processedEvents.has(eventKey)
+      ) {
+        return;
+      }
+
+      processedEvents.add(
+        eventKey
+      );
+
+      setTimeout(() => {
+        processedEvents.delete(
+          eventKey
+        );
+      }, 30_000);
+
+      const entry =
+        await findAuditExecutor(
+          guild,
+          AuditLogEvent.ChannelDelete,
+          channel.id
+        );
+
+      if (!entry?.executorId) {
+        return;
+      }
+
+      const executor =
+        await guild.members
+          .fetch(entry.executorId)
+          .catch(() => null);
+
+      if (!executor) {
+        return;
+      }
+
+      if (
+        isServerOwner(executor) ||
+        isWhitelisted(
+          guild,
+          executor.id
+        )
+      ) {
+        return;
+      }
+
+      await enforceLimit({
+        guild,
+        member: executor,
+        action: "channel"
+      });
+    } catch (error) {
+      console.error(
+        "[BK] channelDelete error:",
+        error
+      );
+    }
+  }
+);
+
+/* =========================================================
+   WEBHOOK MONITOR
+   ========================================================= */
+
+client.on(
+  "webhooksUpdate",
+  async (channel) => {
+    try {
+      if (!channel.guild) {
+        return;
+      }
+
+      const guild =
+        channel.guild;
+
+      const entry =
+        await findAuditExecutor(
+          guild,
+          AuditLogEvent.WebhookCreate
+        );
+
+      if (!entry?.executorId) {
+        return;
+      }
+
+      const executor =
+        await guild.members
+          .fetch(entry.executorId)
+          .catch(() => null);
+
+      if (!executor) {
+        return;
+      }
+
+      if (
+        isServerOwner(executor) ||
+        isWhitelisted(
+          guild,
+          executor.id
+        )
+      ) {
+        return;
+      }
+
+      await enforceLimit({
+        guild,
+        member: executor,
+        action: "webhook"
+      });
+    } catch (error) {
+      console.error(
+        "[BK] webhooksUpdate error:",
+        error
+      );
+    }
+  }
 );
 
 /* =========================================================
    READY
-========================================================= */
+   ========================================================= */
 
 client.once(
-    "ready",
-    () => {
-        console.log("");
-        console.log(
-            "======================================"
-        );
-        console.log(
-            `             ${BOT_NAME}`
-        );
-        console.log(
-            `          SECURITY ${VERSION}`
-        );
-        console.log(
-            "======================================"
-        );
-        console.log(
-            `Logged in as: ${client.user.tag}`
-        );
-        console.log(
-            `Guilds: ${client.guilds.cache.size}`
-        );
-        console.log(
-            "Anti-nuke: ACTIVE"
-        );
-        console.log(
-            "ID tracking: ACTIVE"
-        );
-        console.log(
-            "Audit verification: ACTIVE"
-        );
-        console.log(
-            "Error recovery: ACTIVE"
-        );
-        console.log(
-            "======================================"
-        );
-        console.log("");
-    }
+  "ready",
+  () => {
+    console.log("");
+    console.log("╭────────────────────────────────────╮");
+    console.log("│              BK SECURITY           │");
+    console.log("├────────────────────────────────────┤");
+    console.log(`│ version → ${VERSION}`.padEnd(37) + "│");
+    console.log(`│ prefix  → ${PREFIX}`.padEnd(37) + "│");
+    console.log(`│ user    → ${client.user.tag}`.padEnd(37) + "│");
+    console.log(`│ guilds  → ${client.guilds.cache.size}`.padEnd(37) + "│");
+    console.log("│ status  → online                   │");
+    console.log("╰────────────────────────────────────╯");
+    console.log("");
+  }
 );
-
-/* =========================================================
-   LOGIN
-========================================================= */
-
-const token =
-    process.env.DISCORD_TOKEN;
-
-if (!token) {
-    console.error("");
-    console.error(
-        "======================================"
-    );
-    console.error(
-        "[BK LOGIN ERROR]"
-    );
-    console.error(
-        "DISCORD_TOKEN is missing."
-    );
-    console.error(
-        "======================================"
-    );
-    console.error("");
-} else {
-    client.login(token).catch(
-        error => {
-            console.error(
-                "[BK LOGIN ERROR]",
-                error
-            );
-        }
-    );
-}
 
 /* =========================================================
    PROCESS SAFETY
-========================================================= */
+   ========================================================= */
 
 process.on(
-    "unhandledRejection",
-    error => {
-        console.error(
-            "[BK UNHANDLED REJECTION]",
-            error
-        );
-    }
+  "unhandledRejection",
+  (reason) => {
+    console.error(
+      "[BK] Unhandled rejection:",
+      reason
+    );
+  }
 );
 
 process.on(
-    "uncaughtException",
-    error => {
-        console.error(
-            "[BK UNCAUGHT EXCEPTION]",
-            error
-        );
-
-        /*
-         * Do not blindly kill the bot.
-         * discord.js can recover from many runtime errors.
-         */
-    }
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "[BK] Uncaught exception:",
+      error
+    );
+  }
 );
 
 process.on(
-    "SIGINT",
-    async () => {
-        console.log(
-            "[BK] Shutting down..."
-        );
+  "SIGINT",
+  async () => {
+    console.log(
+      "[BK] Shutting down..."
+    );
 
-        saveDatabase();
+    saveDatabase();
 
-        try {
-            client.destroy();
-        } catch {}
+    try {
+      client.destroy();
+    } catch {}
 
-        process.exitCode = 0;
-    }
+    process.exit(0);
+  }
 );
 
 process.on(
-    "SIGTERM",
-    async () => {
-        console.log(
-            "[BK] Shutting down..."
-        );
+  "SIGTERM",
+  async () => {
+    console.log(
+      "[BK] Shutting down..."
+    );
 
-        saveDatabase();
+    saveDatabase();
 
-        try {
-            client.destroy();
-        } catch {}
+    try {
+      client.destroy();
+    } catch {}
 
-        process.exitCode = 0;
-    }
+    process.exit(0);
+  }
+);
+
+/* =========================================================
+   START
+   ========================================================= */
+
+loadDatabase();
+
+const token =
+  process.env.DISCORD_TOKEN;
+
+if (!token) {
+  console.error("");
+  console.error(
+    "╭────────────────────────────────────╮"
+  );
+  console.error(
+    "│              ⚠ BK ERROR            │"
+  );
+  console.error(
+    "├────────────────────────────────────┤"
+  );
+  console.error(
+    "│ DISCORD_TOKEN is missing.          │"
+  );
+  console.error(
+    "│                                    │"
+  );
+  console.error(
+    "│ add it to your .env file.          │"
+  );
+  console.error(
+    "╰────────────────────────────────────╯"
+  );
+  console.error("");
+
+  process.exit(1);
+}
+
+client.login(token).catch(
+  (error) => {
+    console.error(
+      "[BK LOGIN ERROR]",
+      error
+    );
+
+    process.exit(1);
+  }
 );
